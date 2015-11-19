@@ -21,13 +21,10 @@ class BaseDescriptor(object):
             try:
                 translation = get_translation(instance)
             except self.opts.translations_model.DoesNotExist:
-                raise self._NoTranslationError('Accessing a translated field requires that '
-                                               'the instance has a translation loaded, or a '
-                                               'valid translation in current language (%s) '
-                                               'loadable from the database' % get_language())
+                language_code = instance.default_language
+                translation = instance.translations.get(language_code = language_code)
             set_cached_translation(instance, translation)
         return translation
-
 
 class TranslatedAttribute(BaseDescriptor):
     """ Proxies attributes from the shared instance to the translated instance. """
