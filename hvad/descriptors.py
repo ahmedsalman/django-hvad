@@ -16,14 +16,15 @@ class BaseDescriptor(object):
                                         {})
     
     def translation(self, instance):
-
         translation = get_cached_translation(instance)
         if translation is None:
             try:
                 translation = get_translation(instance)
             except self.opts.translations_model.DoesNotExist:
-                language_code = instance.default_language
-                translation = instance.translations.get(language_code = language_code)
+                raise self._NoTranslationError('Accessing a translated field requires that '
+                                               'the instance has a translation loaded, or a '
+                                               'valid translation in current language (%s) '
+                                               'loadable from the database' % get_language())
             set_cached_translation(instance, translation)
         return translation
 

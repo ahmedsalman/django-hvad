@@ -7,8 +7,10 @@ if django.VERSION >= (1, 9):
     from django.db.models.query import QuerySet
 elif django.VERSION >= (1, 8):
     from django.db.models.query import QuerySet, ValuesQuerySet
-else:
+elif django.VERSION >= (1, 6):
     from django.db.models.query import QuerySet, ValuesQuerySet, DateQuerySet, DateTimeQuerySet
+else:
+    from django.db.models.query import QuerySet, ValuesQuerySet, DateQuerySet
 if django.VERSION >= (1, 8):
     from django.db.models.sql.datastructures import Join, LOUTER
 from django.db.models.sql.constants import GET_ITERATOR_CHUNK_SIZE as CHUNK_SIZE
@@ -33,7 +35,7 @@ _logger = logging.getLogger(__name__)
 def update_settings(*args, **kwargs):
     global FALLBACK_LANGUAGES, LEGACY_FALLBACKS
     FALLBACK_LANGUAGES = tuple(code for code, name in settings.LANGUAGES)
-    LEGACY_FALLBACKS = bool(getattr(settings, 'HVAD_LEGACY_FALLBACKS', False))
+    LEGACY_FALLBACKS = bool(getattr(settings, 'HVAD_LEGACY_FALLBACKS', django.VERSION < (1, 6)))
 
 #===============================================================================
 
@@ -190,6 +192,7 @@ class TranslationQueryset(QuerySet):
         override_classes[ValuesQuerySet] = ValuesMixin
     if django.VERSION < (1, 8):
         override_classes[DateQuerySet] = SkipMasterSelectMixin
+    if django.VERSION >= (1, 6) and django.VERSION < (1, 8):
         override_classes[DateTimeQuerySet] = SkipMasterSelectMixin
     _skip_master_select = False
 
@@ -498,6 +501,7 @@ class TranslationQueryset(QuerySet):
         self._language_code = language_code
         return self
 
+    @minimumDjangoVersion(1, 6)
     def fallbacks(self, *fallbacks):
         if not fallbacks:
             self._language_fallbacks = FALLBACK_LANGUAGES
@@ -563,17 +567,23 @@ class TranslationQueryset(QuerySet):
                         delattr(obj, name)
                 obj = combine(obj, qs.shared_model)
                 # use known objects from self, not qs as we cleared it earlier
-                for field, rel_objs in self._known_related_objects.items():
-                    if hasattr(obj, field.get_cache_name()):
-                        # should not happen, but we conform to Django behavior
-                        continue #pragma: no cover
-                    pk = getattr(obj, field.get_attname())
-                    try:
-                        rel_obj = rel_objs[pk]
-                    except KeyError: #pragma: no cover
-                        pass
-                    else:
-                        setattr(obj, field.name, rel_obj)
+                if django.VERSION >= (1, 6):
+                    for field, rel_objs in self._known_related_objects.items():
+                        if hasattr(obj, field.get_cache_name()):
+                            # should not happen, but we conform to Django behavior
+                            continue #pragma: no cover
+                        pk = getattr(obj, field.get_attname())
+                        try:
+                            rel_obj = rel_objs[pk]
+                        except KeyError: #pragma: no cover
+                            pass
+                        else:
+                            setattr(obj, field.name, rel_obj)
+                else:
+                    kro_attname, kro_instance = (getattr(self, 'known_related_object', None)
+                                                 or (None, None))
+                    if kro_instance:
+                        setattr(obj, kro_attname, kro_instance)
                 yield obj
 
     def create(self, **kwargs):
@@ -638,16 +648,31 @@ class TranslationQueryset(QuerySet):
             raise ValueError('Cannot create an object with language \'all\'')
 
         obj = self.shared_model(**params)
-        try:
-            with transaction.atomic(using=self.db):
-                obj.save(force_insert=True, using=self.db)
-            return obj, True
-        except IntegrityError:
-            exc_info = sys.exc_info()
+        if django.VERSION >= (1, 6):
             try:
-                return self.get(**lookup), False
-            except self.model.DoesNotExist:
-                raise exc_info[1]
+                with transaction.atomic(using=self.db):
+                    obj.save(force_insert=True, using=self.db)
+                return obj, True
+            except IntegrityError:
+                exc_info = sys.exc_info()
+                try:
+                    return self.get(**lookup), False
+                except self.model.DoesNotExist:
+                    raise exc_info[1]
+        else:
+            try:
+                sid = transaction.savepoint(using=self.db)
+                obj.save(force_insert=True, using=self.db)
+                transaction.savepoint_commit(sid, using=self.db)
+                return obj, True
+            except IntegrityError:
+                transaction.savepoint_rollback(sid, using=self.db)
+                exc_info = sys.exc_info()
+                try:
+                    return self.get(**lookup), False
+                except self.model.DoesNotExist:
+                    # Re-raise the IntegrityError with its original traceback.
+                    raise exc_info[1]
 
     @minimumDjangoVersion(1, 7)
     def update_or_create(self, defaults=None, **kwargs):
@@ -672,6 +697,7 @@ class TranslationQueryset(QuerySet):
         field_name = self.field_translator(field_name or self.shared_model._meta.get_latest_by)
         return super(TranslationQueryset, self).latest(field_name)
 
+    @minimumDjangoVersion(1, 6)
     def earliest(self, field_name=None):
         field_name = self.field_translator(field_name or self.shared_model._meta.get_latest_by)
         return super(TranslationQueryset, self).earliest(field_name)
@@ -747,6 +773,7 @@ class TranslationQueryset(QuerySet):
             field_name = self.field_translator(field_name)
         return super(TranslationQueryset, self).dates(field_name, kind=kind, order=order)
 
+    @minimumDjangoVersion(1, 6)
     def datetimes(self, field, *args, **kwargs):
         if django.VERSION < (1, 8):
             field = self.field_translator(field)
@@ -824,9 +851,10 @@ class _SharedFallbackQueryset(QuerySet):
                 'TranslationManager.untranslated().use_fallbacks() is not supported on Django 1.9, '
                 'and is deprecated on previous versions as well. Please use the fallbacks() method '
                 'on queryset instead, eg: MyModel.objects.language().fallbacks()')
-        warnings.warn('TranslationManager.untranslated().use_fallbacks() is deprecated. '
-                      'Please use the fallbacks() method on queryset instead, eg: '
-                      'MyModel.objects.language().fallbacks()', DeprecationWarning, stacklevel=2)
+        if django.VERSION >= (1, 6):
+            warnings.warn('TranslationManager.untranslated().use_fallbacks() is deprecated. '
+                        'Please use the fallbacks() method on queryset instead, eg: '
+                        'MyModel.objects.language().fallbacks()', DeprecationWarning, stacklevel=2)
         self.translation_fallbacks = fallbacks or (None,)+FALLBACK_LANGUAGES
         return self
 
@@ -1063,6 +1091,7 @@ class TranslationManager(models.Manager):
 
     def get_queryset(self):
         return self._make_queryset(self.default_class, False)
+    get_query_set = get_queryset        # old name for Django < 1.6
 
     #===========================================================================
     # Internals
@@ -1160,6 +1189,7 @@ class TranslationAwareQueryset(QuerySet):
                 extra &= Q(**{join: lang})
         return self._filter_extra(extra).latest(field_name)
 
+    @minimumDjangoVersion(1, 6)
     def earliest(self, field_name=None):
         extra = Q()
         if field_name:
@@ -1187,6 +1217,7 @@ class TranslationAwareQueryset(QuerySet):
     def dates(self, field_name, kind, order='ASC'):
         raise NotImplementedError()
 
+    @minimumDjangoVersion(1, 6)
     def datetimes(self, field, *args, **kwargs):
         raise NotImplementedError()
 
@@ -1242,11 +1273,16 @@ class TranslationAwareQueryset(QuerySet):
 
 class TranslationAwareManager(models.Manager):
     def language(self, language_code=None):
-        return self.get_queryset().language(language_code)
+        if django.VERSION >= (1, 6):
+            return self.get_queryset().language(language_code)
+        else:
+            return self.get_query_set().language(language_code)
 
     def get_queryset(self):
         qs = TranslationAwareQueryset(self.model, using=self.db)
         return qs
+    get_query_set = get_queryset        # old name for Django < 1.6
+
 
 #===============================================================================
 # Translations Model Manager
