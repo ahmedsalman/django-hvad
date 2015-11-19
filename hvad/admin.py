@@ -313,7 +313,10 @@ class TranslatableAdmin(ModelAdmin, TranslatableModelAdminMixin):
             # if language does not match that of request, we know request_lang
             # does not exist, because it was the first language in the use_fallbacks
             # list. We prepare it as a new translation.
-            obj.translate(request_lang)
+            try:
+                obj.translations.get(language_code=request_lang)
+            except:
+                obj.translate(request_lang)
         return obj
 
     def get_queryset(self, request):
